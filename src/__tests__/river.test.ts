@@ -474,7 +474,7 @@ describe('river entity wrapping', () => {
 
   it('entity moving left wraps from left edge to right', () => {
     const entity: RiverEntity = {
-      x: -entity_width_placeholder() - 1,
+      x: -(TILE_SIZE * 3) - 1,
       row: 2,
       width: TILE_SIZE * 3,
       type: RiverEntityType.LOG,
@@ -484,10 +484,6 @@ describe('river entity wrapping', () => {
     const updated = updateRiverEntity(entity, 16)
     expect(updated.x).toBe(CANVAS_W)
   })
-
-  function entity_width_placeholder(): number {
-    return TILE_SIZE * 3
-  }
 })
 
 // ─── All river entities creation ────────────────────────────────────────────

@@ -11,6 +11,7 @@ import {
   SCORE_TIME_BONUS_PER_SEC,
   DELTA_CAP_MS,
   LEVEL_TIMER_SECONDS,
+  LEVEL_SPEED_MULTIPLIER,
   LANE_CONFIGS,
   ROAD_ROWS,
   RIVER_ROWS,
@@ -176,6 +177,21 @@ export class GameEngine {
       return true
     }
 
+    // Skip collision and timer advance while death flash is playing
+    if (this.frog.deathFlashFrames > 0) {
+      this.frog = { ...this.frog, deathFlashFrames: this.frog.deathFlashFrames - 1 }
+      if (this.frog.deathFlashFrames === 0) {
+        this.saveBestScore()
+        this.frog = makeFrog()
+        this.timerSeconds = LEVEL_TIMER_SECONDS
+        this.timerElapsedMs = 0
+      }
+      // Still update entities so scene stays alive during flash
+      this.vehicles = this.vehicles.map(v => updateVehicle(v, deltaMs))
+      this.riverEntities = this.riverEntities.map(e => updateRiverEntity(e, deltaMs))
+      return true
+    }
+
     // Update timer
     this.updateTimer(deltaMs)
 
@@ -187,18 +203,6 @@ export class GameEngine {
 
     // Update river entities
     this.riverEntities = this.riverEntities.map(e => updateRiverEntity(e, deltaMs))
-
-    // Skip collision when flashing
-    if (this.frog.deathFlashFrames > 0) {
-      this.frog = { ...this.frog, deathFlashFrames: this.frog.deathFlashFrames - 1 }
-      if (this.frog.deathFlashFrames === 0) {
-        this.saveBestScore()
-        this.frog = makeFrog()
-        this.timerSeconds = LEVEL_TIMER_SECONDS
-        this.timerElapsedMs = 0
-      }
-      return true
-    }
 
     // River riding (rows 1-5)
     if (this.isInRiver()) {
@@ -346,12 +350,11 @@ export class GameEngine {
     this.frog = makeFrog()
     this.timerSeconds = LEVEL_TIMER_SECONDS
     this.timerElapsedMs = 0
-    // Rebuild vehicles with new level speed (via lane configs scaled elsewhere)
-    // For vehicles: scale current speeds
-    this.vehicles = this.vehicles.map(v => ({
-      ...v,
-      speed: v.speed * 1.1,
-    }))
+    // Rebuild vehicles from scratch with level-scaled base speed (avoids compounding)
+    const levelMultiplier = Math.pow(LEVEL_SPEED_MULTIPLIER, this.level - 1)
+    this.vehicles = LANE_CONFIGS.flatMap(lane =>
+      createLaneVehicles({ ...lane, baseSpeed: lane.baseSpeed * levelMultiplier })
+    )
     // Rebuild river entities at new level (handles width shrinkage + new speeds)
     this.riverEntities = createAllRiverEntities(this.level)
   }
