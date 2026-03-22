@@ -1,5 +1,5 @@
-import { Direction, GameState } from './types.ts'
-import type { FrogState, VehicleState, RiverEntity, HomeSlot, GameMode } from './types.ts'
+import { Direction, GameState, GameMode } from './types.ts'
+import type { FrogState, VehicleState, RiverEntity, HomeSlot } from './types.ts'
 import {
   COLS,
   FROG_START_COL,
@@ -321,11 +321,12 @@ export class GameEngine {
 
   private updateHopAnimation(deltaMs: number): void {
     if (this.frog.hopProgress >= 1) return
+    const wasHopComplete = this.frog.hopProgress >= 1
     const newProgress = Math.min(1, this.frog.hopProgress + deltaMs / HOP_DURATION_MS)
     this.frog = { ...this.frog, hopProgress: newProgress }
 
     // When hop completes, trigger squash
-    if (newProgress >= 1 && this.frog.hopProgress >= 1) {
+    if (!wasHopComplete && newProgress >= 1) {
       this.squashTimeMs = SQUASH_DURATION_MS
       this.frog = {
         ...this.frog,
@@ -491,7 +492,7 @@ export class GameEngine {
 
   private triggerDeath(cause: DeathCause): void {
     // Track daily attempt result for the slot the frog was trying to reach
-    if (this.mode === 'daily' && this.frog.row === 0) {
+    if (this.mode === GameMode.DAILY && this.frog.row === 0) {
       const col = this.frog.col
       const slotIndex = this.homes.findIndex(h => h.tileX === col && !h.filled)
       if (slotIndex >= 0 && this.homeAttemptResults[slotIndex] === 'unreached') {

@@ -4,7 +4,6 @@ import { useState } from 'react'
 
 interface DailyResultCardProps {
   result: DailyResult
-  onPlayAgain?: () => void
   onMenu: () => void
 }
 

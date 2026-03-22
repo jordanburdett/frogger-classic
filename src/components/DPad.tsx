@@ -1,8 +1,7 @@
 import { Direction } from '../game/types.ts'
-import type { Direction as DirectionType } from '../game/types.ts'
 
 interface DPadProps {
-  onDirection: (dir: DirectionType) => void
+  onDirection: (dir: Direction) => void
 }
 
 const BTN_SIZE = 72
@@ -26,7 +25,7 @@ const buttonStyle: React.CSSProperties = {
 }
 
 export default function DPad({ onDirection }: DPadProps) {
-  function makePointerDown(dir: DirectionType) {
+  function makePointerDown(dir: Direction) {
     return (e: React.PointerEvent) => {
       e.preventDefault()
       onDirection(dir)
