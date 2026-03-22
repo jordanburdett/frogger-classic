@@ -13,6 +13,7 @@ import {
   LEVEL_TIMER_SECONDS,
   LEVEL_SPEED_MULTIPLIER,
   LANE_CONFIGS,
+  RIVER_LANE_CONFIGS,
   ROAD_ROWS,
   RIVER_ROWS,
   CANVAS_W,
@@ -41,7 +42,7 @@ import {
 import { VehicleType } from './types.ts'
 import { createLaneVehicles, updateVehicle, checkVehicleCollision } from './vehicles.ts'
 import {
-  createAllRiverEntities,
+  createRiverLaneEntities,
   updateRiverEntity,
   findRidingEntity,
   isOnSnake,
@@ -49,6 +50,28 @@ import {
   checkHomeSlot,
   allHomesFilled,
 } from './river.ts'
+import type { DailyConfig, HomeAttemptResult } from './daily.ts'
+
+// Hop animation constants
+const HOP_DURATION_MS = 100
+const SQUASH_DURATION_MS = 80
+
+// Death cause type (for audio callback differentiation)
+export const DeathCause = {
+  VEHICLE: 'vehicle',
+  WATER: 'water',
+  TIMER: 'timer',
+} as const
+export type DeathCause = typeof DeathCause[keyof typeof DeathCause]
+
+// Audio callbacks injected from outside (avoids AudioEngine import coupling)
+export interface AudioCallbacks {
+  onHop?: () => void
+  onSplashDeath?: () => void
+  onSquishDeath?: () => void
+  onHomeFill?: () => void
+  onLevelClear?: () => void
+}
 
 function makeFrog(): FrogState {
   return {
@@ -58,6 +81,8 @@ function makeFrog(): FrogState {
     facing: Direction.UP,
     deathFlashFrames: 0,
     alive: true,
+    hopProgress: 1,
+    hopScale: { x: 1, y: 1 },
   }
 }
 
@@ -85,9 +110,23 @@ export class GameEngine {
 
   private pendingDirection: Direction = Direction.NONE
   private lastTimestamp: number | null = null
-  private boundKeyHandler: (e: KeyboardEvent) => void
   // Track time for ripple animation
   private elapsedSec: number = 0
+
+  // Hop animation
+  private hopStartRow: number = FROG_START_ROW
+  private hopTargetRow: number = FROG_START_ROW
+  private squashTimeMs: number = 0
+
+  // Daily challenge
+  private dailyConfig: DailyConfig | null = null
+  // homeAttemptResults tracks per-slot outcomes for daily mode
+  homeAttemptResults: HomeAttemptResult[] = Array(5).fill('unreached')
+
+  // Audio callbacks (wired by GameCanvas)
+  audioCallbacks: AudioCallbacks = {}
+
+  private boundKeyHandler: (e: KeyboardEvent) => void
 
   constructor() {
     this.boundKeyHandler = this.handleKey.bind(this)
@@ -119,30 +158,40 @@ export class GameEngine {
     }
   }
 
-  startGame(mode: GameMode): void {
+  startGame(mode: GameMode, dailyConfig: DailyConfig | null = null): void {
     this.mode = mode
+    this.dailyConfig = dailyConfig
     this.lives = INITIAL_LIVES
     this.score = 0
     this.level = 1
     this.frog = makeFrog()
-    this.vehicles = LANE_CONFIGS.flatMap(lane => createLaneVehicles(lane))
-    this.riverEntities = createAllRiverEntities(this.level)
+    this.homeAttemptResults = Array(5).fill('unreached')
+    this.vehicles = this.buildVehicles(1)
+    this.riverEntities = this.buildRiverEntities(1)
     this.homes = createHomeSlots()
     this.timerSeconds = LEVEL_TIMER_SECONDS
     this.timerElapsedMs = 0
     this.levelClearFrames = 0
     this.lastTimestamp = null
     this.elapsedSec = 0
+    this.squashTimeMs = 0
     this.state = GameState.PLAYING
   }
 
   restartGame(): void {
-    if (this.mode) this.startGame(this.mode)
+    if (this.mode) this.startGame(this.mode, this.dailyConfig)
   }
 
   goToMenu(): void {
     this.state = GameState.MODE_SELECT
     this.pendingDirection = Direction.NONE
+  }
+
+  /** Called externally (GameCanvas) to inject a direction from touch/swipe. */
+  pushDirection(dir: Direction): void {
+    if (this.state === GameState.PLAYING) {
+      this.pendingDirection = dir
+    }
   }
 
   private handleKey(e: KeyboardEvent): void {
@@ -153,6 +202,43 @@ export class GameEngine {
       case 'ArrowLeft':  case 'a': case 'A': this.pendingDirection = Direction.LEFT;  e.preventDefault(); break
       case 'ArrowRight': case 'd': case 'D': this.pendingDirection = Direction.RIGHT; e.preventDefault(); break
     }
+  }
+
+  /** Build vehicles for a given level, optionally using daily config round. */
+  private buildVehicles(level: number): VehicleState[] {
+    const roundIdx = level - 1
+    if (this.dailyConfig && roundIdx < this.dailyConfig.rounds.length) {
+      const round = this.dailyConfig.rounds[roundIdx]
+      return LANE_CONFIGS.flatMap((lane, i) => {
+        const speedMul = round.laneSpeedMultipliers[i] ?? 1
+        const count = round.vehicleCounts[i] ?? lane.vehicleCount
+        return createLaneVehicles({
+          ...lane,
+          baseSpeed: lane.baseSpeed * speedMul,
+          vehicleCount: count,
+        })
+      })
+    }
+    const levelMultiplier = Math.pow(LEVEL_SPEED_MULTIPLIER, level - 1)
+    return LANE_CONFIGS.flatMap(lane =>
+      createLaneVehicles({ ...lane, baseSpeed: lane.baseSpeed * levelMultiplier })
+    )
+  }
+
+  /** Build river entities for a given level, optionally using daily config round. */
+  private buildRiverEntities(level: number): RiverEntity[] {
+    const roundIdx = level - 1
+    if (this.dailyConfig && roundIdx < this.dailyConfig.rounds.length) {
+      const round = this.dailyConfig.rounds[roundIdx]
+      return RIVER_LANE_CONFIGS.flatMap((lane, i) => {
+        const widthOverride = round.logWidthTiles[i]
+        return createRiverLaneEntities(
+          { ...lane, entityWidthTiles: widthOverride ?? lane.entityWidthTiles },
+          level
+        )
+      })
+    }
+    return RIVER_LANE_CONFIGS.flatMap(lane => createRiverLaneEntities(lane, level))
   }
 
   /** Process one RAF frame. Returns true if canvas needs a redraw. */
@@ -168,7 +254,6 @@ export class GameEngine {
     // If level clear overlay is showing, count it down
     if (this.levelClearFrames > 0) {
       this.levelClearFrames--
-      // Still update entities during the overlay so scene stays alive
       this.vehicles = this.vehicles.map(v => updateVehicle(v, deltaMs))
       this.riverEntities = this.riverEntities.map(e => updateRiverEntity(e, deltaMs))
       if (this.levelClearFrames === 0) {
@@ -186,17 +271,27 @@ export class GameEngine {
         this.timerSeconds = LEVEL_TIMER_SECONDS
         this.timerElapsedMs = 0
       }
-      // Still update entities so scene stays alive during flash
       this.vehicles = this.vehicles.map(v => updateVehicle(v, deltaMs))
       this.riverEntities = this.riverEntities.map(e => updateRiverEntity(e, deltaMs))
       return true
     }
 
+    // Update hop animation
+    this.updateHopAnimation(deltaMs)
+
+    // Update squash animation (post-landing)
+    this.updateSquashAnimation(deltaMs)
+
+    // Only process movement/collisions if hop is complete
+    const hopDone = this.frog.hopProgress >= 1
+
     // Update timer
     this.updateTimer(deltaMs)
 
-    // Apply pending input (hop movement)
-    this.applyMovement()
+    // Apply pending input (hop movement) — only if no hop in progress
+    if (hopDone) {
+      this.applyMovement()
+    }
 
     // Update vehicles
     this.vehicles = this.vehicles.map(v => updateVehicle(v, deltaMs))
@@ -204,19 +299,19 @@ export class GameEngine {
     // Update river entities
     this.riverEntities = this.riverEntities.map(e => updateRiverEntity(e, deltaMs))
 
-    // River riding (rows 1-5)
-    if (this.isInRiver()) {
-      this.applyRiverRiding(deltaMs)
-    }
+    // River riding and collision only when hop is done
+    if (hopDone) {
+      if (this.isInRiver()) {
+        this.applyRiverRiding(deltaMs)
+      }
 
-    // Vehicle collision (road rows 7-11)
-    if (this.isOnRoad()) {
-      for (const vehicle of this.vehicles) {
-        // Use frog's current tile col for road collision
-        const frogCol = Math.floor(this.frog.x / TILE_SIZE)
-        if (checkVehicleCollision(frogCol, this.frog.row, vehicle)) {
-          this.triggerDeath()
-          break
+      if (this.isOnRoad()) {
+        for (const vehicle of this.vehicles) {
+          const frogCol = Math.floor(this.frog.x / TILE_SIZE)
+          if (checkVehicleCollision(frogCol, this.frog.row, vehicle)) {
+            this.triggerDeath(DeathCause.VEHICLE)
+            break
+          }
         }
       }
     }
@@ -224,13 +319,38 @@ export class GameEngine {
     return true
   }
 
+  private updateHopAnimation(deltaMs: number): void {
+    if (this.frog.hopProgress >= 1) return
+    const newProgress = Math.min(1, this.frog.hopProgress + deltaMs / HOP_DURATION_MS)
+    this.frog = { ...this.frog, hopProgress: newProgress }
+
+    // When hop completes, trigger squash
+    if (newProgress >= 1 && this.frog.hopProgress >= 1) {
+      this.squashTimeMs = SQUASH_DURATION_MS
+      this.frog = {
+        ...this.frog,
+        hopProgress: 1,
+        hopScale: { x: 1.2, y: 0.8 },
+      }
+    }
+  }
+
+  private updateSquashAnimation(deltaMs: number): void {
+    if (this.squashTimeMs <= 0) return
+    this.squashTimeMs = Math.max(0, this.squashTimeMs - deltaMs)
+    const t = this.squashTimeMs / SQUASH_DURATION_MS // 1→0
+    // Interpolate squash scale back to 1
+    const sx = 1 + (0.2 * t) // 1.2 → 1.0
+    const sy = 1 - (0.2 * t) // 0.8 → 1.0
+    this.frog = { ...this.frog, hopScale: { x: sx, y: sy } }
+  }
+
   private updateTimer(deltaMs: number): void {
     this.timerElapsedMs += deltaMs
     const elapsed = Math.floor(this.timerElapsedMs / 1000)
     this.timerSeconds = Math.max(0, LEVEL_TIMER_SECONDS - elapsed)
     if (this.timerSeconds === 0) {
-      this.triggerDeath()
-      // Note: timerSeconds resets when respawn completes (death flash countdown)
+      this.triggerDeath(DeathCause.TIMER)
     }
   }
 
@@ -247,25 +367,21 @@ export class GameEngine {
     const ridingEntity = findRidingEntity(frogCenterX, this.frog.row, this.riverEntities)
 
     if (!ridingEntity) {
-      // Not on any log/pad → water death
-      this.triggerDeath()
+      this.triggerDeath(DeathCause.WATER)
       return
     }
 
-    // Check for snake on the entity
     if (isOnSnake(frogCenterX, ridingEntity)) {
-      this.triggerDeath()
+      this.triggerDeath(DeathCause.WATER)
       return
     }
 
-    // Move frog with the log/pad
     const dx = ridingEntity.speed * (deltaMs / 1000)
     const newX = this.frog.x + dx
     const newCol = Math.floor((newX + TILE_SIZE / 2) / TILE_SIZE)
 
-    // If frog rides off screen edge → water death
     if (newX < 0 || newX > CANVAS_W - TILE_SIZE) {
-      this.triggerDeath()
+      this.triggerDeath(DeathCause.WATER)
       return
     }
 
@@ -307,7 +423,21 @@ export class GameEngine {
     }
 
     const newX = newCol * TILE_SIZE
-    this.frog = { ...this.frog, col: newCol, row: newRow, x: newX, facing: dir }
+    this.hopStartRow = this.frog.row
+    this.hopTargetRow = newRow
+
+    // Fire hop sound
+    this.audioCallbacks.onHop?.()
+
+    this.frog = {
+      ...this.frog,
+      col: newCol,
+      row: newRow,
+      x: newX,
+      facing: dir,
+      hopProgress: 0, // start hop animation
+      hopScale: { x: 1, y: 1 },
+    }
 
     // Check home slot when frog hops to row 0
     if (newRow === 0) {
@@ -320,27 +450,32 @@ export class GameEngine {
     const slotIndex = checkHomeSlot(frogTileX, this.homes)
 
     if (slotIndex >= 0) {
-      // Valid home slot reached
       const timeBonus = this.timerSeconds * SCORE_TIME_BONUS_PER_SEC
       this.score += SCORE_HOME_BASE + timeBonus
 
-      // Mark home filled
       this.homes = this.homes.map((h, i) =>
         i === slotIndex ? { ...h, filled: true } : h
       )
 
-      // Check level complete
+      // Track daily attempt result
+      if (this.homeAttemptResults[slotIndex] === 'unreached') {
+        this.homeAttemptResults[slotIndex] = 'safe'
+      }
+
+      // Fire home fill sound
+      this.audioCallbacks.onHomeFill?.()
+
       if (allHomesFilled(this.homes)) {
+        // Fire level clear sound
+        this.audioCallbacks.onLevelClear?.()
         this.levelClearFrames = this.LEVEL_CLEAR_FRAMES
       } else {
-        // Respawn frog, reset timer
         this.frog = makeFrog()
         this.timerSeconds = LEVEL_TIMER_SECONDS
         this.timerElapsedMs = 0
       }
     } else {
-      // Wrong tile at row 0 (no home there, or already filled) → water death
-      this.triggerDeath()
+      this.triggerDeath(DeathCause.WATER)
     }
   }
 
@@ -350,16 +485,27 @@ export class GameEngine {
     this.frog = makeFrog()
     this.timerSeconds = LEVEL_TIMER_SECONDS
     this.timerElapsedMs = 0
-    // Rebuild vehicles from scratch with level-scaled base speed (avoids compounding)
-    const levelMultiplier = Math.pow(LEVEL_SPEED_MULTIPLIER, this.level - 1)
-    this.vehicles = LANE_CONFIGS.flatMap(lane =>
-      createLaneVehicles({ ...lane, baseSpeed: lane.baseSpeed * levelMultiplier })
-    )
-    // Rebuild river entities at new level (handles width shrinkage + new speeds)
-    this.riverEntities = createAllRiverEntities(this.level)
+    this.vehicles = this.buildVehicles(this.level)
+    this.riverEntities = this.buildRiverEntities(this.level)
   }
 
-  private triggerDeath(): void {
+  private triggerDeath(cause: DeathCause): void {
+    // Track daily attempt result for the slot the frog was trying to reach
+    if (this.mode === 'daily' && this.frog.row === 0) {
+      const col = this.frog.col
+      const slotIndex = this.homes.findIndex(h => h.tileX === col && !h.filled)
+      if (slotIndex >= 0 && this.homeAttemptResults[slotIndex] === 'unreached') {
+        this.homeAttemptResults[slotIndex] = 'died'
+      }
+    }
+
+    // Fire audio based on cause
+    if (cause === DeathCause.VEHICLE) {
+      this.audioCallbacks.onSquishDeath?.()
+    } else if (cause === DeathCause.WATER) {
+      this.audioCallbacks.onSplashDeath?.()
+    }
+
     this.lives -= 1
 
     if (this.lives <= 0) {
@@ -432,8 +578,6 @@ export class GameEngine {
       ctx.stroke()
     }
     ctx.restore()
-
-    // Median (row 6) already drawn above as COLOR_GRASS/COLOR_MEDIAN
   }
 
   private drawRipples(ctx: CanvasRenderingContext2D): void {
@@ -444,11 +588,9 @@ export class GameEngine {
 
     for (const row of RIVER_ROWS) {
       const rowY = row * TILE_SIZE
-      // 4 ripple lines per row
       for (let lineIdx = 0; lineIdx < 4; lineIdx++) {
         const yBase = rowY + TILE_SIZE * 0.2 + lineIdx * (TILE_SIZE * 0.18)
         ctx.beginPath()
-        // Horizontal sine wave
         const step = 4
         for (let px = 0; px <= CANVAS_W; px += step) {
           const phaseOffset = this.elapsedSec * 0.5 + px * 0.02 + lineIdx * 0.8
@@ -466,7 +608,6 @@ export class GameEngine {
   }
 
   private drawHomeSlots(ctx: CanvasRenderingContext2D): void {
-    // Draw lily-pad style home markers on row 0
     for (const slot of this.homes) {
       const x = slot.tileX * TILE_SIZE
       const y = 0
@@ -475,7 +616,6 @@ export class GameEngine {
       const r = TILE_SIZE * 0.4
 
       if (slot.filled) {
-        // Filled: bright frog color
         ctx.fillStyle = '#40C8E0'
         ctx.beginPath()
         ctx.arc(cx, cy, r, 0, Math.PI * 2)
@@ -484,13 +624,11 @@ export class GameEngine {
         ctx.lineWidth = 2
         ctx.stroke()
       } else {
-        // Empty: outline lily pad
         ctx.strokeStyle = '#5A8C3E'
         ctx.lineWidth = 3
         ctx.beginPath()
         ctx.arc(cx, cy, r, 0, Math.PI * 2)
         ctx.stroke()
-        // Slot notch (gap at bottom)
         ctx.fillStyle = COLOR_HOME_ROW
         ctx.fillRect(cx - 6, cy + r - 4, 12, 8)
       }
@@ -505,12 +643,10 @@ export class GameEngine {
       const h = TILE_SIZE
 
       if (entity.type === 'log') {
-        // Log: brown rounded rect
         ctx.fillStyle = COLOR_LOG
         ctx.beginPath()
         ctx.roundRect(x + 2, y + 6, w - 4, h - 12, 8)
         ctx.fill()
-        // Wood grain lines
         ctx.strokeStyle = 'rgba(0,0,0,0.2)'
         ctx.lineWidth = 1
         ctx.setLineDash([])
@@ -523,12 +659,10 @@ export class GameEngine {
           ctx.stroke()
         }
 
-        // Draw snakes
         for (const snakeOffset of entity.snakeOffsets) {
           this.drawSnakeOnLog(ctx, x + snakeOffset, y)
         }
       } else {
-        // Lily pad: green circle
         const cx = x + TILE_SIZE / 2
         const cy = y + TILE_SIZE / 2
         const r = TILE_SIZE * 0.38
@@ -536,7 +670,6 @@ export class GameEngine {
         ctx.beginPath()
         ctx.arc(cx, cy, r, 0, Math.PI * 2)
         ctx.fill()
-        // Lily pad notch
         ctx.fillStyle = COLOR_RIVER
         ctx.beginPath()
         ctx.moveTo(cx, cy)
@@ -544,7 +677,6 @@ export class GameEngine {
         ctx.lineTo(cx + 6, cy + r)
         ctx.closePath()
         ctx.fill()
-        // White outline
         ctx.strokeStyle = 'rgba(255,255,255,0.5)'
         ctx.lineWidth = 1.5
         ctx.setLineDash([])
@@ -559,7 +691,6 @@ export class GameEngine {
     const cx = tileX + TILE_SIZE / 2
     const cy = rowY + TILE_SIZE / 2
 
-    // Snake body: S-curve
     ctx.strokeStyle = COLOR_SNAKE
     ctx.lineWidth = 5
     ctx.lineCap = 'round'
@@ -569,13 +700,11 @@ export class GameEngine {
     ctx.bezierCurveTo(cx - 8, cy - 8, cx + 8, cy + 8, cx + 14, cy - 6)
     ctx.stroke()
 
-    // Snake head: small orange circle
     ctx.fillStyle = COLOR_SNAKE_HEAD
     ctx.beginPath()
     ctx.arc(cx + 14, cy - 6, 4, 0, Math.PI * 2)
     ctx.fill()
 
-    // Forked tongue
     ctx.strokeStyle = '#FF0000'
     ctx.lineWidth = 1.5
     ctx.beginPath()
@@ -621,26 +750,44 @@ export class GameEngine {
   }
 
   private drawFrog(ctx: CanvasRenderingContext2D): void {
-    const { row, facing, deathFlashFrames } = this.frog
-    const cx = Math.round(this.frog.x) + TILE_SIZE / 2
-    const cy = row * TILE_SIZE + TILE_SIZE / 2
+    const { row, facing, deathFlashFrames, hopProgress, hopScale } = this.frog
+    const baseX = Math.round(this.frog.x) + TILE_SIZE / 2
+    const baseY = row * TILE_SIZE + TILE_SIZE / 2
+
+    // Compute arc Y offset from hop animation
+    const hopOffset = hopProgress < 1
+      ? -Math.sin(hopProgress * Math.PI) * (TILE_SIZE * 0.5)
+      : 0
+
+    // Also interpolate Y from source row to target row during hop
+    const hopRowOffset = hopProgress < 1
+      ? (this.hopTargetRow - this.hopStartRow) * TILE_SIZE * hopProgress
+      - (this.hopTargetRow - this.hopStartRow) * TILE_SIZE
+      : 0
+
+    const cx = baseX
+    const cy = baseY + hopOffset + hopRowOffset
+
     const r = TILE_SIZE * 0.38
 
     const isDead = deathFlashFrames > 0
     const flashOn = isDead && Math.floor(deathFlashFrames / 5) % 2 === 0
 
+    ctx.save()
+    ctx.translate(cx, cy)
+    ctx.scale(hopScale.x, hopScale.y)
+
     ctx.fillStyle = flashOn ? COLOR_FROG_DEAD : COLOR_FROG_BODY
     ctx.beginPath()
-    ctx.arc(cx, cy, r, 0, Math.PI * 2)
+    ctx.arc(0, 0, r, 0, Math.PI * 2)
     ctx.fill()
 
     ctx.fillStyle = COLOR_FROG_BELLY
-    ctx.fillRect(cx - r * 0.5, cy - r * 0.2, r, r * 0.4)
+    ctx.fillRect(-r * 0.5, -r * 0.2, r, r * 0.4)
 
     ctx.fillStyle = flashOn ? '#FF8888' : '#3A6B22'
     const triSize = r * 0.45
     ctx.save()
-    ctx.translate(cx, cy)
     switch (facing) {
       case Direction.UP:    ctx.rotate(0); break
       case Direction.DOWN:  ctx.rotate(Math.PI); break
@@ -658,13 +805,13 @@ export class GameEngine {
     ctx.fillStyle = COLOR_FROG_EYE
     const eyeOffset = r * 0.35
     const eyeR = r * 0.15
-    let eyeX1 = cx - eyeOffset, eyeY1 = cy - r * 0.3
-    let eyeX2 = cx + eyeOffset, eyeY2 = cy - r * 0.3
+    let eyeX1 = -eyeOffset, eyeY1 = -r * 0.3
+    let eyeX2 = eyeOffset, eyeY2 = -r * 0.3
     if (facing === Direction.LEFT || facing === Direction.RIGHT) {
-      eyeX1 = facing === Direction.RIGHT ? cx + r * 0.3 : cx - r * 0.3
-      eyeY1 = cy - eyeOffset
-      eyeX2 = facing === Direction.RIGHT ? cx + r * 0.3 : cx - r * 0.3
-      eyeY2 = cy + eyeOffset
+      eyeX1 = facing === Direction.RIGHT ? r * 0.3 : -r * 0.3
+      eyeY1 = -eyeOffset
+      eyeX2 = facing === Direction.RIGHT ? r * 0.3 : -r * 0.3
+      eyeY2 = eyeOffset
     }
     ctx.beginPath(); ctx.arc(eyeX1, eyeY1, eyeR, 0, Math.PI * 2); ctx.fill()
     ctx.beginPath(); ctx.arc(eyeX2, eyeY2, eyeR, 0, Math.PI * 2); ctx.fill()
@@ -672,6 +819,8 @@ export class GameEngine {
     ctx.fillStyle = '#FFFFFF'
     ctx.beginPath(); ctx.arc(eyeX1 + eyeR * 0.3, eyeY1 - eyeR * 0.3, eyeR * 0.4, 0, Math.PI * 2); ctx.fill()
     ctx.beginPath(); ctx.arc(eyeX2 + eyeR * 0.3, eyeY2 - eyeR * 0.3, eyeR * 0.4, 0, Math.PI * 2); ctx.fill()
+
+    ctx.restore()
   }
 
   private drawTimer(ctx: CanvasRenderingContext2D): void {
@@ -685,9 +834,7 @@ export class GameEngine {
     ctx.textAlign = 'center'
     ctx.fillStyle = urgent ? COLOR_TIMER_URGENT : COLOR_TIMER_NORMAL
 
-    // Draw at top-center of the game canvas area (below home row)
     const timerText = String(this.timerSeconds).padStart(2, '0')
-    // Draw with a shadow for readability
     ctx.shadowColor = 'rgba(0,0,0,0.8)'
     ctx.shadowBlur = 6
     ctx.fillText(timerText, CANVAS_W / 2, TILE_SIZE * 0.75)

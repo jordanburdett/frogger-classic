@@ -40,6 +40,9 @@ export interface FrogState {
   facing: Direction
   deathFlashFrames: number
   alive: boolean
+  // Hop animation state: 0 = idle, 0→1 = animating, 1 = landed
+  hopProgress: number
+  hopScale: { x: number; y: number }
 }
 
 export interface VehicleState {
