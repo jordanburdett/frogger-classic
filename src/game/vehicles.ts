@@ -39,7 +39,7 @@ export function updateVehicle(vehicle: VehicleState, deltaMs: number): VehicleSt
   let newX = vehicle.x + dx
 
   // Wrap when going right (positive speed)
-  if (vehicle.speed > 0 && newX > CANVAS_W) {
+  if (vehicle.speed > 0 && newX >= CANVAS_W) {
     newX = -vehicle.width
   }
   // Wrap when going left (negative speed)

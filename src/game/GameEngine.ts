@@ -25,9 +25,6 @@ import {
   COLOR_CAR_WINDOW,
   COLOR_TRUCK_BODY,
   COLOR_TRUCK_WINDOW,
-  COLOR_HUD_BG,
-  COLOR_HUD_TEXT,
-  COLOR_SCORE_TEXT,
 } from './constants.ts'
 import { VehicleType } from './types.ts'
 import { createLaneVehicles, updateVehicle, checkVehicleCollision } from './vehicles.ts'
@@ -145,7 +142,8 @@ export class GameEngine {
       // Count down flash
       this.frog = { ...this.frog, deathFlashFrames: this.frog.deathFlashFrames - 1 }
       if (this.frog.deathFlashFrames === 0) {
-        // Respawn or game over already handled in triggerDeath
+        this.saveBestScore()
+        this.frog = makeFrog()
       }
     }
 
@@ -187,7 +185,6 @@ export class GameEngine {
 
   private triggerDeath(): void {
     this.lives -= 1
-    this.saveBestScore()
 
     if (this.lives <= 0) {
       this.state = GameState.GAME_OVER
@@ -195,24 +192,12 @@ export class GameEngine {
       return
     }
 
-    // Flash and respawn
+    // Flash — respawn is handled in tick() when deathFlashFrames counts down to 0
     this.frog = {
       ...this.frog,
       deathFlashFrames: DEATH_FLASH_FRAMES,
       alive: false,
     }
-
-    // Schedule respawn after flash (we do it immediately by resetting on flash end)
-    // Actually we handle respawn in tick() when deathFlashFrames reaches 0
-    // but we need to set it up: reset frog position after flash
-    // We use a simple timer via the flash frames counter
-    // The actual position reset happens when deathFlashFrames hits 0
-    const resetAfterFlash = () => {
-      this.frog = makeFrog()
-    }
-    // We set a timeout to reset after the frames elapse
-    // At 60fps, 30 frames = 500ms
-    setTimeout(resetAfterFlash, (DEATH_FLASH_FRAMES / 60) * 1000 + 50)
   }
 
   // ─── Rendering ──────────────────────────────────────────────────────────────
@@ -361,38 +346,4 @@ export class GameEngine {
     ctx.beginPath(); ctx.arc(eyeX2 + eyeR * 0.3, eyeY2 - eyeR * 0.3, eyeR * 0.4, 0, Math.PI * 2); ctx.fill()
   }
 
-  renderHUD(ctx: CanvasRenderingContext2D): void {
-    // Top HUD bar: score + level
-    ctx.fillStyle = COLOR_HUD_BG
-    ctx.fillRect(0, 0, CANVAS_W, 0) // The HUD is drawn in the React overlay, not canvas
-    // Score in top-center area of canvas
-    ctx.fillStyle = COLOR_SCORE_TEXT
-    ctx.font = 'bold 18px monospace'
-    ctx.textAlign = 'center'
-    ctx.fillText(`SCORE: ${this.score}`, CANVAS_W / 2, 22)
-
-    // Level top-right
-    ctx.fillStyle = COLOR_HUD_TEXT
-    ctx.textAlign = 'right'
-    ctx.fillText(`LVL ${this.level}`, CANVAS_W - 8, 22)
-
-    // Lives as small frog icons bottom-left
-    ctx.textAlign = 'left'
-    ctx.font = '18px monospace'
-    for (let i = 0; i < this.lives; i++) {
-      this.drawMiniLife(ctx, 8 + i * 28, CANVAS_H - 24)
-    }
-
-    ctx.textAlign = 'left' // reset
-  }
-
-  private drawMiniLife(ctx: CanvasRenderingContext2D, x: number, y: number): void {
-    ctx.fillStyle = COLOR_FROG_BODY
-    ctx.beginPath()
-    ctx.arc(x + 8, y + 8, 8, 0, Math.PI * 2)
-    ctx.fill()
-    ctx.fillStyle = COLOR_FROG_EYE
-    ctx.beginPath(); ctx.arc(x + 5, y + 6, 2, 0, Math.PI * 2); ctx.fill()
-    ctx.beginPath(); ctx.arc(x + 11, y + 6, 2, 0, Math.PI * 2); ctx.fill()
-  }
 }
